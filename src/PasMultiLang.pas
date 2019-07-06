@@ -47,7 +47,7 @@
  * 10. Make sure the code runs on platforms with weak and strong memory       *
  *     models without any issues.                                             *
  *                                                                            *
- ******************************************************************************
+ ******************************************************************************)
 unit PasMultiLang;
 {$ifdef fpc}
  {$mode delphi}
