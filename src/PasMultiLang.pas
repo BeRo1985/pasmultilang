@@ -160,6 +160,38 @@ type TPasMultiLangSizeInt={$if declared(NativeInt)}NativeInt{$elseif declared(Pt
 
      TPasMultiLangUTF8StringArray=array of TPasMultiLangUTF8String;
 
+     // The plural form expression of a PO file header is a C-like expression, which is compiled here into a simple
+     // reverse polish notation instruction list, so that it can be evaluated afterwards without any reparsing and
+     // without any memory allocations at all
+     TPasMultiLangPluralFormOperation=
+      (
+       PushConstant,
+       PushCount,
+       LogicalNot,
+       Multiply,
+       Divide,
+       Modulo,
+       Add,
+       Subtract,
+       Less,
+       LessOrEqual,
+       Greater,
+       GreaterOrEqual,
+       Equal,
+       NotEqual,
+       LogicalAnd,
+       LogicalOr,
+       Select
+      );
+
+     PPasMultiLangPluralFormInstruction=^TPasMultiLangPluralFormInstruction;
+     TPasMultiLangPluralFormInstruction=record
+      Operation:TPasMultiLangPluralFormOperation;
+      Value:TPasMultiLangUInt64;
+     end;
+
+     TPasMultiLangPluralFormInstructions=array of TPasMultiLangPluralFormInstruction;
+
      PPasMultiLangUInt8=^UInt8;
 
      TPasMultiLangUInt8Array=array[0..65535] of UInt8;
@@ -264,9 +296,17 @@ type TPasMultiLangSizeInt={$if declared(NativeInt)}NativeInt{$elseif declared(Pt
        fMultipleReaderSingleWriterLock:TPasMPMultipleReaderSingleWriterLock;
        fTranslationItemList:TTranslationItemList;
        fTranslationItemHashMap:TTranslationItemHashMap;
+       fCountPluralForms:TPasMultiLangSizeInt;
+       fPluralFormInstructions:TPasMultiLangPluralFormInstructions;
       protected
        class function RoundUpToPowerOfTwoSizeUInt(x:TPasMultiLangSizeUInt):TPasMultiLangSizeUInt; static;
        class function GetHashMapKey(const aContext,aOriginal:TPasMultiLangUTF8String):TPasMultiLangUTF8String; static;
+       class function ParsePluralFormExpression(const aExpression:TPasMultiLangUTF8String;out aInstructions:TPasMultiLangPluralFormInstructions):boolean; static;
+       class function EvaluatePluralFormExpression(const aInstructions:TPasMultiLangPluralFormInstructions;const aCount:TPasMultiLangUInt64):TPasMultiLangUInt64; static;
+       procedure SetDefaultPluralFormsUnlocked;
+       procedure ParsePluralFormsFromHeaderUnlocked;
+       function GetPluralFormIndexUnlocked(const aCount:TPasMultiLangUInt64):TPasMultiLangSizeInt;
+       function TranslateUnlocked(const aContext,aOriginal,aOriginalPlural:TPasMultiLangUTF8String;const aPluralIndex,aFallbackIndex:TPasMultiLangSizeInt;const aCreateIfNotExist:boolean):TPasMultiLangUTF8String;
       public
        constructor Create; reintroduce;
        destructor Destroy; override;
@@ -283,6 +323,11 @@ type TPasMultiLangSizeInt={$if declared(NativeInt)}NativeInt{$elseif declared(Pt
        procedure LoadMOFromFile(const aFileName:string);
        function Translate(const aOriginal:TPasMultiLangUTF8String;const aPluralIndex:TPasMultiLangSizeInt=0;const aCreateIfNotExist:boolean=false):TPasMultiLangUTF8String; overload;
        function Translate(const aContext,aOriginal:TPasMultiLangUTF8String;const aPluralIndex:TPasMultiLangSizeInt=0;const aCreateIfNotExist:boolean=false):TPasMultiLangUTF8String; overload;
+       function TranslatePlural(const aOriginal,aOriginalPlural:TPasMultiLangUTF8String;const aCount:TPasMultiLangUInt64;const aCreateIfNotExist:boolean=false):TPasMultiLangUTF8String; overload;
+       function TranslatePlural(const aContext,aOriginal,aOriginalPlural:TPasMultiLangUTF8String;const aCount:TPasMultiLangUInt64;const aCreateIfNotExist:boolean=false):TPasMultiLangUTF8String; overload;
+       function GetPluralFormIndex(const aCount:TPasMultiLangUInt64):TPasMultiLangSizeInt;
+       function SetPluralForms(const aCountPluralForms:TPasMultiLangSizeInt;const aExpression:TPasMultiLangUTF8String):boolean;
+       property CountPluralForms:TPasMultiLangSizeInt read fCountPluralForms;
      end;
 
 implementation
@@ -310,6 +355,438 @@ begin
   result:=aContext+TPasMultiLangUTF8Char(#4)+aOriginal;
  end else begin
   result:=aOriginal;
+ end;
+end;
+
+// Compiles a C-like plural form expression as it is found inside the "Plural-Forms:" header field of PO and MO
+// files, for example "n%10==1 && n%100!=11 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2", into a
+// reverse polish notation instruction list. The supported subset is the one which GNU gettext does support for
+// this purpose as well, namely the variable n, unsigned integer literals, the unary operators ! + - , the binary
+// operators * / % + - < <= > >= == != && || and the ternary ?: operator together with parentheses.
+class function TPasMultiLang.ParsePluralFormExpression(const aExpression:TPasMultiLangUTF8String;out aInstructions:TPasMultiLangPluralFormInstructions):boolean;
+var Position,Len,CountInstructions:TPasMultiLangSizeInt;
+ procedure Emit(const aOperation:TPasMultiLangPluralFormOperation;const aValue:TPasMultiLangUInt64=0);
+ begin
+  if CountInstructions>=length(aInstructions) then begin
+   SetLength(aInstructions,(CountInstructions+1)*2);
+  end;
+  aInstructions[CountInstructions].Operation:=aOperation;
+  aInstructions[CountInstructions].Value:=aValue;
+  inc(CountInstructions);
+ end;
+ procedure SkipWhiteSpace;
+ begin
+  while (Position<=Len) and (aExpression[Position] in [#0..#32]) do begin
+   inc(Position);
+  end;
+ end;
+ function ParseSubExpression(const aMinimumPrecedence:TPasMultiLangSizeInt):boolean;
+ var Operation:TPasMultiLangPluralFormOperation;
+     Precedence,OperatorLength:TPasMultiLangSizeInt;
+     Value:TPasMultiLangUInt64;
+  function ParseValue:boolean;
+  begin
+   result:=false;
+   SkipWhiteSpace;
+   if Position>Len then begin
+    exit;
+   end;
+   case aExpression[Position] of
+    '!':begin
+     inc(Position);
+     if not ParseValue then begin
+      exit;
+     end;
+     Emit(TPasMultiLangPluralFormOperation.LogicalNot);
+     result:=true;
+    end;
+    '+':begin
+     inc(Position);
+     result:=ParseValue;
+    end;
+    '-':begin
+     inc(Position);
+     Emit(TPasMultiLangPluralFormOperation.PushConstant,0);
+     if not ParseValue then begin
+      exit;
+     end;
+     Emit(TPasMultiLangPluralFormOperation.Subtract);
+     result:=true;
+    end;
+    '(':begin
+     inc(Position);
+     if not ParseSubExpression(1) then begin
+      exit;
+     end;
+     SkipWhiteSpace;
+     if (Position>Len) or (aExpression[Position]<>')') then begin
+      exit;
+     end;
+     inc(Position);
+     result:=true;
+    end;
+    '0'..'9':begin
+     Value:=0;
+     while (Position<=Len) and (aExpression[Position] in ['0'..'9']) do begin
+      Value:=(Value*10)+TPasMultiLangUInt64(UInt8(TPasMultiLangUTF8Char(aExpression[Position]))-UInt8(TPasMultiLangUTF8Char('0')));
+      inc(Position);
+     end;
+     Emit(TPasMultiLangPluralFormOperation.PushConstant,Value);
+     result:=true;
+    end;
+    'n':begin
+     inc(Position);
+     if (Position<=Len) and (aExpression[Position] in ['a'..'z','A'..'Z','0'..'9','_']) then begin
+      exit; // Since it is then a longer and therefore unknown identifier
+     end;
+     Emit(TPasMultiLangPluralFormOperation.PushCount);
+     result:=true;
+    end;
+    else begin
+     exit;
+    end;
+   end;
+  end;
+ begin
+  result:=false;
+  if not ParseValue then begin
+   exit;
+  end;
+  repeat
+   SkipWhiteSpace;
+   if Position>Len then begin
+    break;
+   end;
+   OperatorLength:=1;
+   case aExpression[Position] of
+    '*':begin
+     Operation:=TPasMultiLangPluralFormOperation.Multiply;
+     Precedence:=7;
+    end;
+    '/':begin
+     Operation:=TPasMultiLangPluralFormOperation.Divide;
+     Precedence:=7;
+    end;
+    '%':begin
+     Operation:=TPasMultiLangPluralFormOperation.Modulo;
+     Precedence:=7;
+    end;
+    '+':begin
+     Operation:=TPasMultiLangPluralFormOperation.Add;
+     Precedence:=6;
+    end;
+    '-':begin
+     Operation:=TPasMultiLangPluralFormOperation.Subtract;
+     Precedence:=6;
+    end;
+    '<':begin
+     if (Position<Len) and (aExpression[Position+1]='=') then begin
+      Operation:=TPasMultiLangPluralFormOperation.LessOrEqual;
+      OperatorLength:=2;
+     end else begin
+      Operation:=TPasMultiLangPluralFormOperation.Less;
+     end;
+     Precedence:=5;
+    end;
+    '>':begin
+     if (Position<Len) and (aExpression[Position+1]='=') then begin
+      Operation:=TPasMultiLangPluralFormOperation.GreaterOrEqual;
+      OperatorLength:=2;
+     end else begin
+      Operation:=TPasMultiLangPluralFormOperation.Greater;
+     end;
+     Precedence:=5;
+    end;
+    '=':begin
+     if (Position<Len) and (aExpression[Position+1]='=') then begin
+      Operation:=TPasMultiLangPluralFormOperation.Equal;
+      OperatorLength:=2;
+      Precedence:=4;
+     end else begin
+      exit; // Since a single = is not a valid operator here
+     end;
+    end;
+    '!':begin
+     if (Position<Len) and (aExpression[Position+1]='=') then begin
+      Operation:=TPasMultiLangPluralFormOperation.NotEqual;
+      OperatorLength:=2;
+      Precedence:=4;
+     end else begin
+      exit; // Since a single ! is not a valid binary operator here
+     end;
+    end;
+    '&':begin
+     if (Position<Len) and (aExpression[Position+1]='&') then begin
+      Operation:=TPasMultiLangPluralFormOperation.LogicalAnd;
+      OperatorLength:=2;
+      Precedence:=3;
+     end else begin
+      exit; // Since the bitwise and operator is not supported here
+     end;
+    end;
+    '|':begin
+     if (Position<Len) and (aExpression[Position+1]='|') then begin
+      Operation:=TPasMultiLangPluralFormOperation.LogicalOr;
+      OperatorLength:=2;
+      Precedence:=2;
+     end else begin
+      exit; // Since the bitwise or operator is not supported here
+     end;
+    end;
+    else begin
+     Precedence:=0;
+    end;
+   end;
+   if Precedence<Max(aMinimumPrecedence,1) then begin
+    break;
+   end;
+   inc(Position,OperatorLength);
+   if not ParseSubExpression(Precedence+1) then begin // Plus one, since all these binary operators are left associative
+    exit;
+   end;
+   Emit(Operation);
+  until false;
+  if aMinimumPrecedence<=1 then begin
+   SkipWhiteSpace;
+   if (Position<=Len) and (aExpression[Position]='?') then begin
+    inc(Position);
+    if not ParseSubExpression(1) then begin
+     exit;
+    end;
+    SkipWhiteSpace;
+    if (Position>Len) or (aExpression[Position]<>':') then begin
+     exit;
+    end;
+    inc(Position);
+    if not ParseSubExpression(1) then begin // Not plus one here, since the ternary operator is right associative
+     exit;
+    end;
+    Emit(TPasMultiLangPluralFormOperation.Select);
+   end;
+  end;
+  result:=true;
+ end;
+begin
+ aInstructions:=nil;
+ CountInstructions:=0;
+ Position:=1;
+ Len:=length(aExpression);
+ result:=ParseSubExpression(1);
+ if result then begin
+  SkipWhiteSpace;
+  result:=Position>Len; // Since trailing garbage does mean that the expression was not understood completely
+ end;
+ if result then begin
+  SetLength(aInstructions,CountInstructions);
+ end else begin
+  aInstructions:=nil;
+ end;
+end;
+
+class function TPasMultiLang.EvaluatePluralFormExpression(const aInstructions:TPasMultiLangPluralFormInstructions;const aCount:TPasMultiLangUInt64):TPasMultiLangUInt64;
+var Index,StackPointer:TPasMultiLangSizeInt;
+    Left,Right:TPasMultiLangUInt64;
+    Stack:array[0..31] of TPasMultiLangUInt64;
+begin
+ result:=0;
+ StackPointer:=0;
+ for Index:=0 to length(aInstructions)-1 do begin
+  case aInstructions[Index].Operation of
+   TPasMultiLangPluralFormOperation.PushConstant,
+   TPasMultiLangPluralFormOperation.PushCount:begin
+    if StackPointer>=length(Stack) then begin
+     exit; // Since the expression is too complex for the fixed size evaluation stack
+    end;
+    if aInstructions[Index].Operation=TPasMultiLangPluralFormOperation.PushCount then begin
+     Stack[StackPointer]:=aCount;
+    end else begin
+     Stack[StackPointer]:=aInstructions[Index].Value;
+    end;
+    inc(StackPointer);
+   end;
+   TPasMultiLangPluralFormOperation.LogicalNot:begin
+    if StackPointer<1 then begin
+     exit;
+    end;
+    Stack[StackPointer-1]:=ord(Stack[StackPointer-1]=0) and 1;
+   end;
+   TPasMultiLangPluralFormOperation.Select:begin
+    if StackPointer<3 then begin
+     exit;
+    end;
+    dec(StackPointer,2);
+    if Stack[StackPointer-1]<>0 then begin
+     Stack[StackPointer-1]:=Stack[StackPointer];
+    end else begin
+     Stack[StackPointer-1]:=Stack[StackPointer+1];
+    end;
+   end;
+   else begin
+    if StackPointer<2 then begin
+     exit;
+    end;
+    dec(StackPointer);
+    Left:=Stack[StackPointer-1];
+    Right:=Stack[StackPointer];
+    case aInstructions[Index].Operation of
+     TPasMultiLangPluralFormOperation.Multiply:begin
+      Left:=Left*Right;
+     end;
+     TPasMultiLangPluralFormOperation.Divide:begin
+      if Right=0 then begin
+       Left:=0; // Since a division by zero must not crash here, a malformed expression is enough of a problem already
+      end else begin
+       Left:=Left div Right;
+      end;
+     end;
+     TPasMultiLangPluralFormOperation.Modulo:begin
+      if Right=0 then begin
+       Left:=0;
+      end else begin
+       Left:=Left mod Right;
+      end;
+     end;
+     TPasMultiLangPluralFormOperation.Add:begin
+      Left:=Left+Right;
+     end;
+     TPasMultiLangPluralFormOperation.Subtract:begin
+      Left:=Left-Right;
+     end;
+     TPasMultiLangPluralFormOperation.Less:begin
+      Left:=ord(Left<Right) and 1;
+     end;
+     TPasMultiLangPluralFormOperation.LessOrEqual:begin
+      Left:=ord(Left<=Right) and 1;
+     end;
+     TPasMultiLangPluralFormOperation.Greater:begin
+      Left:=ord(Left>Right) and 1;
+     end;
+     TPasMultiLangPluralFormOperation.GreaterOrEqual:begin
+      Left:=ord(Left>=Right) and 1;
+     end;
+     TPasMultiLangPluralFormOperation.Equal:begin
+      Left:=ord(Left=Right) and 1;
+     end;
+     TPasMultiLangPluralFormOperation.NotEqual:begin
+      Left:=ord(Left<>Right) and 1;
+     end;
+     TPasMultiLangPluralFormOperation.LogicalAnd:begin
+      Left:=ord((Left<>0) and (Right<>0)) and 1;
+     end;
+     else {TPasMultiLangPluralFormOperation.LogicalOr:}begin
+      Left:=ord((Left<>0) or (Right<>0)) and 1;
+     end;
+    end;
+    Stack[StackPointer-1]:=Left;
+   end;
+  end;
+ end;
+ if StackPointer>0 then begin
+  result:=Stack[StackPointer-1];
+ end;
+end;
+
+// The default is the same one which GNU gettext does assume when a catalog does not contain any plural form
+// information at all, namely the two form Germanic rule
+procedure TPasMultiLang.SetDefaultPluralFormsUnlocked;
+begin
+ fCountPluralForms:=2;
+ ParsePluralFormExpression('n != 1',fPluralFormInstructions);
+end;
+
+// The plural form information is stored inside the "Plural-Forms:" field of the header entry, which is the entry
+// with an empty original string
+procedure TPasMultiLang.ParsePluralFormsFromHeaderUnlocked;
+var Position,LineEnd,Len:TPasMultiLangSizeInt;
+    CountPluralForms:TPasMultiLangUInt64;
+    Header,Line,Expression:TPasMultiLangUTF8String;
+    Instructions:TPasMultiLangPluralFormInstructions;
+    TranslationItem:TTranslationItem;
+ // Only ASCII is lowercased here on purpose, since the header field names and the expression itself are ASCII only
+ function LowerCaseASCII(const aString:TPasMultiLangUTF8String):TPasMultiLangUTF8String;
+ var Index:TPasMultiLangSizeInt;
+ begin
+  result:=aString;
+  for Index:=1 to length(result) do begin
+   if result[Index] in ['A'..'Z'] then begin
+    inc(PPasMultiLangUInt8(@result[Index])^,ord('a')-ord('A'));
+   end;
+  end;
+ end;
+ // Searches for a "<name> = " assignment and returns the position just after the equal sign, or otherwise zero
+ function FindAssignment(const aLine,aName:TPasMultiLangUTF8String):TPasMultiLangSizeInt;
+ var Index,NameLength:TPasMultiLangSizeInt;
+ begin
+  result:=0;
+  NameLength:=length(aName);
+  Index:=1;
+  while Index<=(length(aLine)-(NameLength-1)) do begin
+   if (Copy(aLine,Index,NameLength)=aName) and
+      ((Index=1) or not (aLine[Index-1] in ['a'..'z','A'..'Z','0'..'9','_'])) then begin
+    Index:=Index+NameLength;
+    while (Index<=length(aLine)) and (aLine[Index] in [#0..#32]) do begin
+     inc(Index);
+    end;
+    if (Index<=length(aLine)) and (aLine[Index]='=') then begin
+     result:=Index+1;
+     exit;
+    end;
+   end else begin
+    inc(Index);
+   end;
+  end;
+ end;
+begin
+ SetDefaultPluralFormsUnlocked;
+ TranslationItem:=fTranslationItemHashMap[GetHashMapKey('','')];
+ if assigned(TranslationItem) and (length(TranslationItem.fTranslated)>0) then begin
+  Header:=LowerCaseASCII(TranslationItem.fTranslated[0]);
+  Position:=Pos(TPasMultiLangUTF8String('plural-forms:'),Header);
+  if Position>0 then begin
+   LineEnd:=Position;
+   while (LineEnd<=length(Header)) and not (Header[LineEnd] in [#10,#13]) do begin
+    inc(LineEnd);
+   end;
+   Line:=Copy(Header,Position,LineEnd-Position);
+   CountPluralForms:=0;
+   Position:=FindAssignment(Line,'nplurals');
+   if Position>0 then begin
+    Len:=length(Line);
+    while (Position<=Len) and (Line[Position] in [#0..#32]) do begin
+     inc(Position);
+    end;
+    while (Position<=Len) and (Line[Position] in ['0'..'9']) do begin
+     CountPluralForms:=(CountPluralForms*10)+TPasMultiLangUInt64(UInt8(TPasMultiLangUTF8Char(Line[Position]))-UInt8(TPasMultiLangUTF8Char('0')));
+     inc(Position);
+    end;
+   end;
+   Position:=FindAssignment(Line,'plural');
+   if (Position>0) and (CountPluralForms>0) then begin
+    Len:=length(Line);
+    LineEnd:=Position;
+    while (LineEnd<=Len) and (Line[LineEnd]<>';') do begin
+     inc(LineEnd);
+    end;
+    Expression:=Copy(Line,Position,LineEnd-Position);
+    if ParsePluralFormExpression(Expression,Instructions) then begin
+     fCountPluralForms:=CountPluralForms;
+     fPluralFormInstructions:=Instructions;
+    end;
+   end;
+  end;
+ end;
+end;
+
+function TPasMultiLang.GetPluralFormIndexUnlocked(const aCount:TPasMultiLangUInt64):TPasMultiLangSizeInt;
+begin
+ result:=TPasMultiLangSizeInt(EvaluatePluralFormExpression(fPluralFormInstructions,aCount));
+ if result<0 then begin
+  result:=0;
+ end else if result>=fCountPluralForms then begin
+  result:=fCountPluralForms-1; // The very same guard as the one inside the GNU gettext runtime
+ end;
+ if result<0 then begin
+  result:=0;
  end;
 end;
 
@@ -905,6 +1382,8 @@ begin
  fTranslationItemList:=TTranslationItemList.Create;
  fTranslationItemList.OwnsObjects:=true;
  fTranslationItemHashMap:=TTranslationItemHashMap.Create(nil);
+ fPluralFormInstructions:=nil;
+ SetDefaultPluralFormsUnlocked;
 end;
 
 destructor TPasMultiLang.Destroy;
@@ -923,6 +1402,7 @@ begin
  try
   fTranslationItemList.Clear;
   fTranslationItemHashMap.Clear;
+  SetDefaultPluralFormsUnlocked;
  finally
   if aLock then begin
    fMultipleReaderSingleWriterLock.ReleaseWrite;
@@ -992,6 +1472,7 @@ begin
     end;
    end;
   end;
+  ParsePluralFormsFromHeaderUnlocked;
  finally
   fMultipleReaderSingleWriterLock.ReleaseWrite;
  end;
@@ -1336,6 +1817,7 @@ begin
     finally
      Data:='';
     end;
+    ParsePluralFormsFromHeaderUnlocked;
    finally
     fMultipleReaderSingleWriterLock.ReleaseWrite;
    end;
@@ -1587,6 +2069,7 @@ begin
   finally
    OriginalStringTable:=nil;
   end;
+  ParsePluralFormsFromHeaderUnlocked;
  finally
   fMultipleReaderSingleWriterLock.ReleaseWrite;
  end;
@@ -1603,32 +2086,44 @@ begin
  end;
 end;
 
-function TPasMultiLang.Translate(const aOriginal:TPasMultiLangUTF8String;const aPluralIndex:TPasMultiLangSizeInt=0;const aCreateIfNotExist:boolean=false):TPasMultiLangUTF8String;
-begin
- result:=Translate('',aOriginal,aPluralIndex,aCreateIfNotExist);
-end;
-
-function TPasMultiLang.Translate(const aContext,aOriginal:TPasMultiLangUTF8String;const aPluralIndex:TPasMultiLangSizeInt=0;const aCreateIfNotExist:boolean=false):TPasMultiLangUTF8String;
+// Expects that the read lock is already acquired by the caller, so that a plural form index and the translation
+// itself are always fetched from one and the same state. An empty aOriginalPlural does mean that the caller does
+// not know any plural form at all, and aFallbackIndex is the form which is used when the catalog does not contain
+// the string, where the plural rule of the source language does apply then, which is the English one, just like
+// the GNU gettext runtime does it.
+function TPasMultiLang.TranslateUnlocked(const aContext,aOriginal,aOriginalPlural:TPasMultiLangUTF8String;const aPluralIndex,aFallbackIndex:TPasMultiLangSizeInt;const aCreateIfNotExist:boolean):TPasMultiLangUTF8String;
 var HashMapKey:TPasMultiLangUTF8String;
     TranslationItem:TTranslationItem;
 begin
- result:=aOriginal;
  HashMapKey:=GetHashMapKey(aContext,aOriginal);
- fMultipleReaderSingleWriterLock.AcquireRead;
- try
-  TranslationItem:=fTranslationItemHashMap[HashMapKey];
-  if assigned(TranslationItem) then begin
-   result:=TranslationItem.GetTranslated(aPluralIndex);
-  end else if aCreateIfNotExist then begin
+ TranslationItem:=fTranslationItemHashMap[HashMapKey];
+ if assigned(TranslationItem) then begin
+  result:=TranslationItem.GetTranslated(aPluralIndex);
+ end else begin
+  if (length(aOriginalPlural)>0) and (aFallbackIndex>0) then begin
+   result:=aOriginalPlural;
+  end else begin
+   result:=aOriginal;
+  end;
+  if aCreateIfNotExist then begin
    fMultipleReaderSingleWriterLock.ReadToWrite;
    try
     TranslationItem:=TTranslationItem.Create;
     try
      TranslationItem.fContext:=aContext;
-     SetLength(TranslationItem.fOriginal,1);
-     TranslationItem.fOriginal[0]:=aOriginal;
-     SetLength(TranslationItem.fTranslated,1);
-     TranslationItem.fTranslated[0]:=aOriginal;
+     if length(aOriginalPlural)>0 then begin
+      SetLength(TranslationItem.fOriginal,2);
+      TranslationItem.fOriginal[0]:=aOriginal;
+      TranslationItem.fOriginal[1]:=aOriginalPlural;
+      SetLength(TranslationItem.fTranslated,2);
+      TranslationItem.fTranslated[0]:=aOriginal;
+      TranslationItem.fTranslated[1]:=aOriginalPlural;
+     end else begin
+      SetLength(TranslationItem.fOriginal,1);
+      TranslationItem.fOriginal[0]:=aOriginal;
+      SetLength(TranslationItem.fTranslated,1);
+      TranslationItem.fTranslated[0]:=aOriginal;
+     end;
     finally
      try
       fTranslationItemList.Add(TranslationItem);
@@ -1640,8 +2135,68 @@ begin
     fMultipleReaderSingleWriterLock.WriteToRead;
    end;
   end;
+ end;
+end;
+
+function TPasMultiLang.Translate(const aOriginal:TPasMultiLangUTF8String;const aPluralIndex:TPasMultiLangSizeInt=0;const aCreateIfNotExist:boolean=false):TPasMultiLangUTF8String;
+begin
+ result:=Translate('',aOriginal,aPluralIndex,aCreateIfNotExist);
+end;
+
+function TPasMultiLang.Translate(const aContext,aOriginal:TPasMultiLangUTF8String;const aPluralIndex:TPasMultiLangSizeInt=0;const aCreateIfNotExist:boolean=false):TPasMultiLangUTF8String;
+begin
+ fMultipleReaderSingleWriterLock.AcquireRead;
+ try
+  result:=TranslateUnlocked(aContext,aOriginal,'',aPluralIndex,0,aCreateIfNotExist);
  finally
   fMultipleReaderSingleWriterLock.ReleaseRead;
+ end;
+end;
+
+function TPasMultiLang.TranslatePlural(const aOriginal,aOriginalPlural:TPasMultiLangUTF8String;const aCount:TPasMultiLangUInt64;const aCreateIfNotExist:boolean=false):TPasMultiLangUTF8String;
+begin
+ result:=TranslatePlural('',aOriginal,aOriginalPlural,aCount,aCreateIfNotExist);
+end;
+
+function TPasMultiLang.TranslatePlural(const aContext,aOriginal,aOriginalPlural:TPasMultiLangUTF8String;const aCount:TPasMultiLangUInt64;const aCreateIfNotExist:boolean=false):TPasMultiLangUTF8String;
+begin
+ fMultipleReaderSingleWriterLock.AcquireRead;
+ try
+  result:=TranslateUnlocked(aContext,
+                            aOriginal,
+                            aOriginalPlural,
+                            GetPluralFormIndexUnlocked(aCount),
+                            ord(aCount<>1) and 1,
+                            aCreateIfNotExist);
+ finally
+  fMultipleReaderSingleWriterLock.ReleaseRead;
+ end;
+end;
+
+function TPasMultiLang.GetPluralFormIndex(const aCount:TPasMultiLangUInt64):TPasMultiLangSizeInt;
+begin
+ fMultipleReaderSingleWriterLock.AcquireRead;
+ try
+  result:=GetPluralFormIndexUnlocked(aCount);
+ finally
+  fMultipleReaderSingleWriterLock.ReleaseRead;
+ end;
+end;
+
+// For catalogs which are built up at runtime instead of being loaded from a PO or MO file, where no header entry
+// with the plural form information does exist
+function TPasMultiLang.SetPluralForms(const aCountPluralForms:TPasMultiLangSizeInt;const aExpression:TPasMultiLangUTF8String):boolean;
+var Instructions:TPasMultiLangPluralFormInstructions;
+begin
+ result:=(aCountPluralForms>0) and ParsePluralFormExpression(aExpression,Instructions);
+ if result then begin
+  fMultipleReaderSingleWriterLock.AcquireWrite;
+  try
+   fCountPluralForms:=aCountPluralForms;
+   fPluralFormInstructions:=Instructions;
+  finally
+   fMultipleReaderSingleWriterLock.ReleaseWrite;
+  end;
  end;
 end;
 
