@@ -6,7 +6,7 @@
  *                                zlib license                                *
  *============================================================================*
  *                                                                            *
- * Copyright (C) 2003-2019, Benjamin Rosseaux (benjamin@rosseaux.de)          *
+ * Copyright (C) 2003-2026, Benjamin Rosseaux (benjamin@rosseaux.de)          *
  *                                                                            *
  * This software is provided 'as-is', without any express or implied          *
  * warranty. In no event will the authors be held liable for any damages      *
@@ -147,7 +147,7 @@ interface
 
 uses SysUtils,Classes,Math,PasMP;
 
-const PASMULTILANG_VERSION='1.00.2019.07.06.0000';
+const PASMULTILANG_VERSION='1.00.2026.09.12.0000';
 
 type TPasMultiLangSizeInt={$if declared(NativeInt)}NativeInt{$elseif declared(PtrInt)}PtrInt{$else}Int32{$ifend};
      TPasMultiLangSizeUInt={$if declared(NativeUInt)}NativeUInt{$elseif declared(PtrUInt)}PtrUInt{$else}UInt32{$ifend};
@@ -157,6 +157,8 @@ type TPasMultiLangSizeInt={$if declared(NativeInt)}NativeInt{$elseif declared(Pt
      TPasMultiLangUTF8String={$if declared(UTF8String)}UTF8String{$else}AnsiString{$ifend};
 
      TPasMultiLangUTF8Char=AnsiChar;
+
+     TPasMultiLangUTF8StringArray=array of TPasMultiLangUTF8String;
 
      PPasMultiLangUInt8=^UInt8;
 
@@ -249,8 +251,8 @@ type TPasMultiLangSizeInt={$if declared(NativeInt)}NativeInt{$elseif declared(Pt
        type TTranslationItem=class
              private
               fContext:TPasMultiLangUTF8String;
-              fOriginal:array of TPasMultiLangUTF8String;
-              fTranslated:array of TPasMultiLangUTF8String;
+              fOriginal:TPasMultiLangUTF8StringArray;
+              fTranslated:TPasMultiLangUTF8StringArray;
              public
               constructor Create; reintroduce;
               destructor Destroy; override;
@@ -264,6 +266,7 @@ type TPasMultiLangSizeInt={$if declared(NativeInt)}NativeInt{$elseif declared(Pt
        fTranslationItemHashMap:TTranslationItemHashMap;
       protected
        class function RoundUpToPowerOfTwoSizeUInt(x:TPasMultiLangSizeUInt):TPasMultiLangSizeUInt; static;
+       class function GetHashMapKey(const aContext,aOriginal:TPasMultiLangUTF8String):TPasMultiLangUTF8String; static;
       public
        constructor Create; reintroduce;
        destructor Destroy; override;
@@ -279,6 +282,7 @@ type TPasMultiLangSizeInt={$if declared(NativeInt)}NativeInt{$elseif declared(Pt
        procedure LoadMOFromStream(const aStream:TStream);
        procedure LoadMOFromFile(const aFileName:string);
        function Translate(const aOriginal:TPasMultiLangUTF8String;const aPluralIndex:TPasMultiLangSizeInt=0;const aCreateIfNotExist:boolean=false):TPasMultiLangUTF8String; overload;
+       function Translate(const aContext,aOriginal:TPasMultiLangUTF8String;const aPluralIndex:TPasMultiLangSizeInt=0;const aCreateIfNotExist:boolean=false):TPasMultiLangUTF8String; overload;
      end;
 
 implementation
@@ -295,6 +299,18 @@ begin
  x:=x or (x shr 32);
 {$endif}
  result:=x+1;
+end;
+
+// Two translation items can share the same original string as long as they do have different contexts, so the
+// context must be a part of the hash map key as well. The used separator character is the same as the one which
+// GNU gettext does use inside MO files for the very same purpose, namely the EOT character.
+class function TPasMultiLang.GetHashMapKey(const aContext,aOriginal:TPasMultiLangUTF8String):TPasMultiLangUTF8String;
+begin
+ if length(aContext)>0 then begin
+  result:=aContext+TPasMultiLangUTF8Char(#4)+aOriginal;
+ end else begin
+  result:=aOriginal;
+ end;
 end;
 
 { TPasMultiLangObjectGenericList<T>.TValueEnumerator }
@@ -954,6 +970,10 @@ begin
        TranslationItem.fOriginal[Index]:=ReadString;
        inc(Index);
       end;
+      // The count of the translated strings is stored separately and must be read separately as well, since it can
+      // differ from the count of the original strings, for example two original strings for the singular form and
+      // the plural form in English but three translated strings for the plural forms in Russian
+      SubCount:=ReadDWord;
       SetLength(TranslationItem.fTranslated,SubCount);
       Index:=0;
       while Index<SubCount do begin
@@ -965,7 +985,7 @@ begin
        fTranslationItemList.Add(TranslationItem);
       finally
        for Index:=0 to length(TranslationItem.fOriginal)-1 do begin
-        fTranslationItemHashMap[TranslationItem.fOriginal[Index]]:=TranslationItem;
+        fTranslationItemHashMap[GetHashMapKey(TranslationItem.fContext,TranslationItem.fOriginal[Index])]:=TranslationItem;
        end;
       end;
      end;
@@ -1229,7 +1249,7 @@ var TranslationItem:TTranslationItem;
   if (length(TranslationItem.fOriginal)>0) and (length(TranslationItem.fTranslated)>0) then begin
    fTranslationItemList.Add(TranslationItem);
    for Index:=0 to length(TranslationItem.fOriginal)-1 do begin
-    fTranslationItemHashMap[TranslationItem.fOriginal[Index]]:=TranslationItem;
+    fTranslationItemHashMap[GetHashMapKey(TranslationItem.fContext,TranslationItem.fOriginal[Index])]:=TranslationItem;
    end;
    TranslationItem:=TTranslationItem.Create;
   end;
@@ -1264,6 +1284,7 @@ begin
             SkipWhiteSpace;
             SetLength(TranslationItem.fOriginal,length(TranslationItem.fOriginal)+1);
             TranslationItem.fContext:=Context;
+            Context:=''; // Since a msgctxt line does belong to the directly following msgid line only
             TranslationItem.fOriginal[length(TranslationItem.fOriginal)-1]:=ParseString;
            end else if Identifier='msgid_plural' then begin
             SkipWhiteSpace;
@@ -1290,7 +1311,7 @@ begin
              SetLength(TranslationItem.fTranslated,length(TranslationItem.fTranslated)+1);
              TranslationItem.fTranslated[length(TranslationItem.fTranslated)-1]:=ParseString;
             end else begin
-             while length(TranslationItem.fTranslated)<Value do begin
+             while length(TranslationItem.fTranslated)<=Value do begin // Must be <= here, since index Value itself must exist as well
               SetLength(TranslationItem.fTranslated,length(TranslationItem.fTranslated)+1);
               TranslationItem.fTranslated[length(TranslationItem.fTranslated)-1]:='';
              end;
@@ -1463,9 +1484,28 @@ type TMOFileHeader=packed record
           (result shr 24);
 {$endif}
  end;
+ // The singular form and the possible plural forms are stored as NUL character separated substrings inside one
+ // and the same string blob, so they must be split apart again here
+ procedure SplitAtNullCharacters(const aString:TPasMultiLangUTF8String;out aStrings:TPasMultiLangUTF8StringArray);
+ var StartPosition,CurrentPosition,Count:TPasMultiLangSizeInt;
+ begin
+  aStrings:=nil;
+  Count:=0;
+  StartPosition:=1;
+  for CurrentPosition:=1 to length(aString)+1 do begin
+   if (CurrentPosition>length(aString)) or (aString[CurrentPosition]=TPasMultiLangUTF8Char(#0)) then begin
+    SetLength(aStrings,Count+1);
+    aStrings[Count]:=Copy(aString,StartPosition,CurrentPosition-StartPosition);
+    inc(Count);
+    StartPosition:=CurrentPosition+1;
+   end;
+  end;
+ end;
 var MOFileHeader:TMOFileHeader;
     OriginalStringTable,TranslatedStringTable:TMOStringTable;
     Index:UInt32;
+    SubIndex,Position:TPasMultiLangSizeInt;
+    RawOriginal,RawTranslated:TPasMultiLangUTF8String;
     TranslationItem:TTranslationItem;
 begin
  fMultipleReaderSingleWriterLock.AcquireWrite;
@@ -1478,7 +1518,9 @@ begin
     MOFileHeader.Magic:=ReadDWord;
     if MOFileHeader.Magic=MOFileHeaderMagic then begin
      MOFileHeader.Revision:=ReadDWord;
-     if MOFileHeader.Revision=MOFileHeaderMagic then begin
+     // The major revision is stored in the upper 16 bits and the minor revision in the lower 16 bits, where only
+     // the major revisions 0 and 1 do exist so far
+     if (MOFileHeader.Revision shr 16)<=1 then begin
       MOFileHeader.CountStrings:=ReadDWord;
       MOFileHeader.OriginalTableOffset:=ReadDWord;
       MOFileHeader.TranslatedTableOffset:=ReadDWord;
@@ -1497,26 +1539,42 @@ begin
        aStream.ReadBuffer(TranslatedStringTable[0],MOFileHeader.CountStrings*SizeOf(TMOStringInfo));
        Index:=0;
        while Index<MOFileHeader.CountStrings do begin
+        RawOriginal:='';
+        SetLength(RawOriginal,OriginalStringTable[Index].Length);
+        if OriginalStringTable[Index].Length>0 then begin
+         if aStream.Seek(OriginalStringTable[Index].Offset,soBeginning)<>OriginalStringTable[Index].Offset then begin
+          raise EInOutError.Create('Seek error');
+         end;
+         aStream.ReadBuffer(RawOriginal[1],OriginalStringTable[Index].Length);
+        end;
+        RawTranslated:='';
+        SetLength(RawTranslated,TranslatedStringTable[Index].Length);
+        if TranslatedStringTable[Index].Length>0 then begin
+         if aStream.Seek(TranslatedStringTable[Index].Offset,soBeginning)<>TranslatedStringTable[Index].Offset then begin
+          raise EInOutError.Create('Seek error');
+         end;
+         aStream.ReadBuffer(RawTranslated[1],TranslatedStringTable[Index].Length);
+        end;
         TranslationItem:=TTranslationItem.Create;
         try
-         SetLength(TranslationItem.fOriginal,1);
-         SetLength(TranslationItem.fOriginal[0],OriginalStringTable[Index].Length);
-         if OriginalStringTable[Index].Length>0 then begin
-          if aStream.Seek(OriginalStringTable[Index].Offset,soBeginning)<>OriginalStringTable[Index].Offset then begin
-           raise EInOutError.Create('Seek error');
-          end;
-          aStream.ReadBuffer(TranslationItem.fOriginal[0][1],OriginalStringTable[Index].Length);
+         // A context is stored as context + EOT character + original string in front of the original string itself
+         Position:=Pos(TPasMultiLangUTF8String(#4),RawOriginal);
+         if Position>0 then begin
+          TranslationItem.fContext:=Copy(RawOriginal,1,Position-1);
+          RawOriginal:=Copy(RawOriginal,Position+1,length(RawOriginal)-Position);
+         end else begin
+          TranslationItem.fContext:='';
          end;
-         SetLength(TranslationItem.fTranslated,1);
-         SetLength(TranslationItem.fTranslated[0],TranslatedStringTable[Index].Length);
-         if TranslatedStringTable[Index].Length>0 then begin
-          if aStream.Seek(TranslatedStringTable[Index].Offset,soBeginning)<>TranslatedStringTable[Index].Offset then begin
-           raise EInOutError.Create('Seek error');
-          end;
-          aStream.ReadBuffer(TranslationItem.fTranslated[0][1],TranslatedStringTable[Index].Length);
-         end;
+         SplitAtNullCharacters(RawOriginal,TranslationItem.fOriginal);
+         SplitAtNullCharacters(RawTranslated,TranslationItem.fTranslated);
         finally
-         fTranslationItemList.Add(TranslationItem);
+         try
+          fTranslationItemList.Add(TranslationItem);
+         finally
+          for SubIndex:=0 to length(TranslationItem.fOriginal)-1 do begin
+           fTranslationItemHashMap[GetHashMapKey(TranslationItem.fContext,TranslationItem.fOriginal[SubIndex])]:=TranslationItem;
+          end;
+         end;
         end;
         inc(Index);
        end;
@@ -1546,12 +1604,19 @@ begin
 end;
 
 function TPasMultiLang.Translate(const aOriginal:TPasMultiLangUTF8String;const aPluralIndex:TPasMultiLangSizeInt=0;const aCreateIfNotExist:boolean=false):TPasMultiLangUTF8String;
-var TranslationItem:TTranslationItem;
+begin
+ result:=Translate('',aOriginal,aPluralIndex,aCreateIfNotExist);
+end;
+
+function TPasMultiLang.Translate(const aContext,aOriginal:TPasMultiLangUTF8String;const aPluralIndex:TPasMultiLangSizeInt=0;const aCreateIfNotExist:boolean=false):TPasMultiLangUTF8String;
+var HashMapKey:TPasMultiLangUTF8String;
+    TranslationItem:TTranslationItem;
 begin
  result:=aOriginal;
+ HashMapKey:=GetHashMapKey(aContext,aOriginal);
  fMultipleReaderSingleWriterLock.AcquireRead;
  try
-  TranslationItem:=fTranslationItemHashMap[aOriginal];
+  TranslationItem:=fTranslationItemHashMap[HashMapKey];
   if assigned(TranslationItem) then begin
    result:=TranslationItem.GetTranslated(aPluralIndex);
   end else if aCreateIfNotExist then begin
@@ -1559,6 +1624,7 @@ begin
    try
     TranslationItem:=TTranslationItem.Create;
     try
+     TranslationItem.fContext:=aContext;
      SetLength(TranslationItem.fOriginal,1);
      TranslationItem.fOriginal[0]:=aOriginal;
      SetLength(TranslationItem.fTranslated,1);
@@ -1567,7 +1633,7 @@ begin
      try
       fTranslationItemList.Add(TranslationItem);
      finally
-      fTranslationItemHashMap[aOriginal]:=TranslationItem;
+      fTranslationItemHashMap[HashMapKey]:=TranslationItem;
      end;
     end;
    finally
